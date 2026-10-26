@@ -40,6 +40,36 @@ fire  ⇔  state=Playing
 - 采样 **1000 ms**，8 次连续不前进才计满；`rate≠1` 时按 `Δpos_expected = elapsed×rate` 缩放，`Δpos < 0.2×expected` 视为不前进。
 - 非 HLS 源 v1 **不启用**（SMB 代理本地读不会静默停滞；先收敛风险面）。
 
+### 2.1 buffering 边界（结论：**有界宽限，不豁免、不重置**）
+
+- **现状**：`PlaybackSnapshot.buffering` 目前在 IJK 路径**恒为 false**——全仓只有 `StoreSinkFactory.onBuffering` 实现，`IjkPlayerBackend` 无调用点。v1 不得依赖该标志。
+- **规则**（若日后接入 IJK onInfo buffering）：`buffering=true` 只给 **`BUFFER_GRACE_MS = 3000`** 的推迟，**不清零**已累计的冻结时长；累计达 8000 ms 照常 fire。即 buffering 最多把 fire 时刻推到 8 s，绝不无限延后。
+- **恢复判定**（先到者生效，立即清零冻结累计与宽限）：`frames>0` 或 `Δpos > 200 ms`。仅 `buffering=false` 而无进展 → **不清零**。
+- **理由**：SFF 局域网切片 2 s，正常缓冲 亚秒~2 s；连续 8 s 无进展 = 漏掉 4 个切片 = 传输已死。若把 buffering 当豁免，恰好会在"服务端已挂但 ijk 仍报 buffering"时失明——那正是 HLS 停滞的典型形态。
+
+### 2.2 seek 沉降边界（结论：沉降期内**暂停累计**，退出需证据）
+
+- **可用信号**（IJK 无 `isSeeking()` API，只能组合以下）：`PlaybackSnapshot.pendingKind === 'Seek'`、`RequestScope.epoch/reqId` 变化、位置跳变（`|Δpos| > 1500 ms` 或 `pos < lastPos`）、`SeekGate.lastDoneAt`（注意：`SERIAL_SETTLE_MS=120` 只是**命令合并**窗口，不是解码沉降，不可直接复用）。
+- **进入沉降**（任一）：提交 Seek / 位置跳变 >1500 ms / 回退 / epoch 变更。
+- **沉降期内**：冻结累计保持 0（不累加、不判定）。
+- **提前退出**（恢复证据，任一即退出）：`Δpos > 200 ms` 或 `frames>0`（解码或输出帧计数）。
+- **沉降上限**：`SEEK_SETTLE_MAX_MS = 12000`（实测远距 seek 2.5–3.2 s，留 4× 余量）。超过上限仍无进展 → 视为卡死，恢复累计，由上限定界不会无限挂起。
+- **不误报保证**：累计只在沉降退出后开始，故沉降 7.9 s（<8000 ms）时，最早 fire 时刻 = 7.9 s + 8 s = 15.9 s，必然晚于沉降结束。
+
+### 2.3 与 T-01 streamFailure 的汇合点（确认：同一漏斗）
+
+`hls-freeze` 与既有两条（`stream-fail`、`hls-stall`）共用同一出口，未新增路径：
+
+```text
+PlayerBootstrapper.ets:189-191   watchdog.setOnHlsStall → host.onHlsStreamFailure('hls-stall', -4, ...)
+PlayerAssembly.ets:489-490       onHlsStreamFailure → this.failHlsStream(reason, code, message)
+PlayerAssembly.ets:225-226       failHlsStream → this.hlsDegrade.fail(reason, code, message)
+PlayerAssembly.ets:236-238       hlsDegrade.downgrade → this.downgrade.downgradeFromHlsDetailed(...)  // :80 SourceDowngradeCtl
+```
+
+- ijk 显式错误走 `PlayerAssembly.ets:257  onHlsStreamFailure('stream-fail', code, message)`，同样落到上面第 2 行。
+- 因此 `'hls-freeze'` 只需作为**第三个 reason 字符串**传入，`HlsDegradeCtl.fail` 内的 HLS 判定、`tried/gen` 去重、`avoid:['SFF']` 全部复用。
+
 ## 3. 落点（复用现有唯一路径，不新增决策路径）
 
 ```
