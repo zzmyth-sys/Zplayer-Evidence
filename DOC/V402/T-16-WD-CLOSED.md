@@ -71,7 +71,7 @@
 
 **同源定义**：同一文件字节（`sha` 未单独记录，按 `size=609,346,839` + 同一拷贝来源核对）。源：AI 视频目录下的 `2160×3840@30 / h264 / GOP 5.0 s / 176.2 s`，拷贝为 `_v402tests/wd_4k_same.mp4`（与源同字节）。GOP 5 s > 2 s → 服务端策略 `transcode`（HLS）；h264 4K30 设备可解 → SMB 兜底可播。
 
-| 项 | A = HLS（transcode） | B = SMB 代理（SmbHttpProxy） |
+| 项 | A = HLS（transcode，**输出 608×1080**） | B = SMB 代理（SmbHttpProxy，原始 2160×3840） |
 |---|---|---|
 | CPU（`top` 进程级单核，3×30 s） | 11.1 / 10.3 / 10.7% → **中位 10.7%** | 96.2 / 85.1 / 157% → **中位 96.2%** |
 | PSS（`hidumper --mem` Total） | 148,601 / 155,895 / 159,484 kB → 中位 **152.2 MB** | 328,874 / 360,163 / 385,780 kB → 中位 **351.7 MB** |
@@ -89,6 +89,10 @@ B 链证据（同一文件，播放中降级产生）：
 （同时刻 8612 连通 False、python=0）
 ```
 
+**A 侧输出分辨率（补标注）**：客户端 `/stream/start` 只发 `{uri, method}`，不带 `maxWidth/maxHeight`；服务端取默认 `ZP_MAX_WIDTH=1920`、`ZP_MAX_HEIGHT=1080`，`encoder.fit(2160, 3840, 1920, 1080)` → **608×1080**。直接证据：SFF 缓存分片名为 `hevc_nvenc-608x1080-transcode-pts1-seg-*.ts`。
+
+因此本轮 A/B **不是同分辨率对照**：A 解码 0.66 MP，B 解码 8.29 MP（像素比 **12.6×**），B 另付代理拷贝税。**9.0× CPU 差距里含分辨率因子**；本数据不能用来说明"同分辨率下代理比 HLS 贵 9 倍"。要剥离该因子，需让 A 输出 4K（客户端上报 maxWidth/maxHeight 或服务端放开上限），属另开单。
+
 对比结论：
 - 同源 4K：B/A = **9.0× CPU**（96.2 / 10.7）、**2.31× PSS**（351.7 / 152.2）。代理链路成本成立，非采样口径问题（两者同为 `top` 进程级、3×30 s、中位）。
 - 历史 `~160%`（HEVC 2160×3840@60 走代理）与本轮 `96.2%`（h264 2160×3840@30 走代理）**同编码层级但不同 codec/fps**；峰值 157% 已进入历史量级。**非同源历史值，不用于否认或确认 160%**；本轮给出的是"同文件、同 codec、同 fps"的干净对照。
@@ -101,10 +105,25 @@ B 链证据（同一文件，播放中降级产生）：
 | **P1-A** | `ProgressFreeze` 沉降退出仍用 `framesAlive`（`:94`）；IJK fps 计数冻结后残留非 0，导致沉降几乎立即退出，12 s 上限与 `seek-settle-exceeded` 实际不可达，seek 保护退化为"8 s 窗口恰好大于 3 s 沉降"的时序巧合 | 本次真机：`freeze: stalled` 行 `frames=true`；`seek-settle-exceeded` 全程 0 条 | 沉降退出改纯位置判据（去掉 `|| s.framesAlive`），并复核 `/frame` 计数可信度 |
 | **P1-B** | 降级后从 0 起播，未续播原位置（冻结时 pos=31.8 s；降级后画面计数 00:00:01.0 起；4K 同源那轮冻结 pos=141.9 s，降级后 `served start=34525108` 亦为新会话起点） | §2 / §4 时间线 | 产品决策：是否在降级 prepare 后 seek 回原位置（涉及 resume 语义与首帧延迟权衡） |
 
-## 6. 分支、合规与恢复
+## 6. 下一改动单排期（未做）
 
-- WD 代码：分支 `topic/v402-p0-1-wd`，commit `093523f`（9 文件 / +446 −10；`PlayerAssembly` 0 改动；`repo-guard: files=664 fail=0 warn=1(tracked-log)`）。**未合入 main，未推远端**；合入需另行确认。
+| 项 | 内容 |
+|---|---|
+| 单号 | `P1-A-1`（建议） |
+| 范围 | `ProgressFreeze` 沉降退出改纯位置判据：删除 `:94` 的 `|| s.framesAlive`，仅保留 `delta > minAdvance`；同步复核 `seek-settle-exceeded` 是否恢复可达 |
+| 提交 | 单独 commit（不与此前 WD 提交混签），同一分支或新分支，仍需 repo-guard 门禁 |
+| 验证矩阵 | seek 5 s / 7.9 s（<8 s 不误报）/ 12 s+（触发 `seek-settle-exceeded` 并按 8 s 窗口判定）三档真机 + 纯逻辑单测三档 |
+| 前置 | 本单不阻塞 4K 同源"剥离分辨率因子"的另行评估 |
+
+## 7. 分支、合规与恢复
+
+- WD 代码：分支 `topic/v402-p0-1-wd`，commit `093523f`（9 文件 / +446 −10；`PlayerAssembly` 0 改动）。
+- `repo-guard`（`scripts/repo-guard.mjs`）实测：`files=664 fail=0 warn=1`。warn 唯一来源 = `[tracked-log] 13 个历史日志仍在版本库`，清单（全部为 v397/v400 既有归档证据，**非本次误入**）：
+  `DOC/evidence/v397/{align-t10-upload.log,align-t10.log,closest-after-fix.log,e2e-local-0.12s.log,e2e-local-1.3s.log}`、
+  `DOC/evidence/v400/perf/{A1-h264-smb-resume.log,A2-h264-smb.log,A3-h264-smb.log,B1-av1-cold.log,B2-av1-warm.log,B3-av1-resume.log,C-seek-storm.log,D-crop-triple.log}`。
+- 处置：**未移除**（移除会把这些证据从后续 clone 的 HEAD 中删除，只有历史里能找到；不属"日志误入"）。故 `warn` 仍为 1；**`093523f` 未合入 main**，待裁决：接受 warn=1 合入，或先 `git rm --cached` 这 13 个归档日志（可回滚）后再合。
 - 本轮未改任何代码；主仓工作区仅剩先存改动 `tests/unit/tests/stream-failure.test.ts`（非本轮）。
 - 设备：已 force-stop；SFF 已恢复生产循环（`/health` 200、`ZPACCEL_NOSTART` 不存在）。
-- 临时产物（SFF 媒体盘 `_v402tests/`，可随时删除）：`wd_hevc1080.mp4`（75 MB，生成）、`wd_4k_same.mp4`（609 MB，同字节拷贝）。合计 684 MB。
+- 临时产物（SFF 媒体盘 `_v402tests/`）**已删除**：`wd_hevc1080.mp4`（75 MB）、`wd_4k_same.mp4`（609 MB），合计 684 MB 已释放。
+- 删除后目录仍有 18 个**既有**文件（`b1.json/backend.log/fault_proxy.py/proxy.log/…`，非本轮产生，未触碰）；如要整目录清空需另确认。
 - 0 IP / 0 序列号 / 0 凭据；样本目录名以 `<4K_SAMPLE>` 或 `_v402tests` 表示。
